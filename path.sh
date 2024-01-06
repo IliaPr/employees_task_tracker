@@ -1,0 +1,1 @@
+/Applications/PostgreSQL 15/SQL Shell (psql).app
