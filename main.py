@@ -1,4 +1,4 @@
-from fastapi import FastAPI, HTTPException, Depends
+from fastapi import FastAPI, HTTPException, Depends, APIRouter
 from sqlalchemy import create_engine, Column, Integer, String, ForeignKey, DateTime, func
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker, relationship, Session
@@ -39,26 +39,14 @@ Base.metadata.create_all(bind=Engine)
 
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=Engine)
 
+Base = declarative_base()
+engine = create_engine(DATABASE_URL)
 
-class EmployeeModel(BaseModel):
-    name: str
-    position: str
-
-
-class TaskModel(BaseModel):
-    name: str
-    parent_task_id: Optional[int] = None
-    executor_id: int
-    deadline: datetime
-    status: str
+# Новый роутер для очистки
+router = APIRouter()
 
 
-class AssignedTask(BaseModel):
-    employee_name: str
-    task_name: str
-
-
-# Dependency to get the database session
+# Зависимость для получения сессии базы данных
 def get_db():
     db = SessionLocal()
     try:
@@ -67,7 +55,47 @@ def get_db():
         db.close()
 
 
-# CRUD operations for employees
+@router.delete("/cleanup")
+def cleanup_tasks(db: Session = Depends(get_db)):
+    # Удаление задач с определенным статусом (например, "completed")
+    db.query(Task).filter(Task.status == "completed").delete()
+
+    # Удаление всех связанных задач перед удалением сотрудников
+    db.query(Task).delete()
+
+    # Удаление всех сотрудников
+    db.query(Employee).delete()
+
+    db.commit()
+    return {"message": "Очистка выполнена"}
+
+
+app.include_router(router)
+
+
+class EmployeeModel(BaseModel):
+    name: str
+    position: str
+
+
+class TaskModel(BaseModel):
+    __tablename__ = "tasks"
+
+    name: str
+    parent_task_id: Optional[int] = None
+    executor_id: Optional[int] = None
+    deadline: datetime
+    status: str
+
+    executor_id = Column(Integer, nullable=True)
+
+
+class AssignedTask(BaseModel):
+    employee_name: str
+    task_name: str
+
+
+# Операции CRUD для сотрудников
 @app.post("/employees/", response_model=EmployeeModel)
 def create_employee(employee: EmployeeModel, db: Session = Depends(get_db)):
     db_employee = Employee(**employee.dict())
@@ -86,10 +114,10 @@ def get_employees(db: Session = Depends(get_db)):
 def delete_employee(employee_id: int, db: Session = Depends(get_db)):
     db.query(Employee).filter(Employee.id == employee_id).delete()
     db.commit()
-    return {"message": "Employee deleted"}
+    return {"message": "Сотрудник удален"}
 
 
-# CRUD operations for tasks
+# Операции CRUD для задач
 @app.post("/tasks/", response_model=TaskModel)
 def create_task(task: TaskModel, db: Session = Depends(get_db)):
     db_task = Task(**task.dict())
@@ -108,14 +136,14 @@ def get_tasks(db: Session = Depends(get_db)):
 def delete_task(task_id: int, db: Session = Depends(get_db)):
     db.query(Task).filter(Task.id == task_id).delete()
     db.commit()
-    return {"message": "Task deleted"}
+    return {"message": "Задача удалена"}
 
 
-# Endpoint for "Важные задачи"
+# Endpoint для "Важных задач" и "Выполняемых задач"
 @app.get("/important_tasks", response_model=List[AssignedTask])
 def important_tasks(db: Session = Depends(get_db)):
     important_tasks = db.query(Task).filter(
-        (Task.status != "в работе") & (Task.parent_task_id != None)
+        (Task.status != "в работе") & (Task.parent_task_id != None) & (Task.executor_id == None)
     ).all()
 
     result = []
@@ -140,7 +168,7 @@ def important_tasks(db: Session = Depends(get_db)):
             executor = least_busy_employee
 
         task_info = {
-            "employee_name": executor.name,
+            "employee_name": executor.name if executor else None,
             "task_name": task.name
         }
 
@@ -149,7 +177,7 @@ def important_tasks(db: Session = Depends(get_db)):
     return result
 
 
-# Endpoint for "Занятые сотрудники"
+# Endpoint для "Занятых сотрудников"
 @app.get("/busy_employees", response_model=List[EmployeeModel])
 def busy_employees(db: Session = Depends(get_db)):
     busy_employees = db.query(Employee).join(Employee.tasks).group_by(Employee.id).order_by(
@@ -158,27 +186,22 @@ def busy_employees(db: Session = Depends(get_db)):
     return busy_employees
 
 
-# Endpoint for assigning a task to an employee
+# Endpoint для назначения задачи сотруднику
 @app.post("/assign_task", response_model=AssignedTask)
 def assign_task(employee_id: int, task_id: int, db: Session = Depends(get_db)):
     employee = db.query(Employee).filter(Employee.id == employee_id).first()
     task = db.query(Task).filter(Task.id == task_id).first()
 
     if not employee or not task:
-        raise HTTPException(status_code=404, detail="Employee or Task not found")
+        raise HTTPException(status_code=404, detail="Сотрудник или задача не найдены")
 
     if task.status == "в работе":
-        raise HTTPException(status_code=400, detail="Task is already in progress")
+        raise HTTPException(status_code=400, detail="Задача уже в работе")
 
-    task.executor = employee
+    # Присвоение executor_id после назначения сотрудника
+    task.executor_id = employee.id
     task.status = "в работе"
     db.commit()
 
     assigned_task = AssignedTask(employee_name=employee.name, task_name=task.name)
     return assigned_task
-
-
-if __name__ == "__main__":
-    import uvicorn
-
-    uvicorn.run(app, host="127.0.0.1", port=8000)
